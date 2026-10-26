@@ -148,10 +148,17 @@ npm ci
 npm test                    # 95 tests, fully offline
 npm run test:coverage       # with coverage
 npm run lint
-npm run test:integration    # optional; needs `docker compose up -d mongo redis`
 ```
 
-The default suite never touches a real database or the network: Mongoose models are swapped for an in-memory fake store (`src/__tests__/helpers/fakeModel.js`) exercised through real Express + Supertest requests, and Redis is backed by `ioredis-mock`. It covers the signature verifiers, rule engine, rate limiter, auth and role middleware, notification fan-out, SDK signing and every route. The integration suite is skipped automatically when MongoDB and Redis aren't reachable. CI runs the unit suite and the client production build on every push.
+Optional integration suite against real MongoDB and Redis:
+
+```bash
+docker compose up -d mongo redis
+MONGO_URI=mongodb://localhost:27017/pulseboard_it REDIS_URL=redis://localhost:6379 \
+  npm run test:integration
+```
+
+The default suite never touches a real database or the network: Mongoose models are swapped for an in-memory fake store (`src/__tests__/helpers/fakeModel.js`) exercised through real Express + Supertest requests, and Redis is backed by `ioredis-mock`. It covers the signature verifiers, rule engine, rate limiter, auth and role middleware, notification fan-out, SDK signing and every route. The integration suite is skipped unless `MONGO_URI` is set (the npm script sets `RUN_INTEGRATION=1`); if it is set but MongoDB is unreachable, the suite fails rather than skips. CI runs the unit suite and the client production build on every push.
 
 ## Project layout
 
