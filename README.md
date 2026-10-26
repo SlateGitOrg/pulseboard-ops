@@ -2,13 +2,28 @@
 
 **Lightweight, self-hosted incident radar for early-stage startups — catch failed payments, deploy errors, and signup spikes before they die quietly in a Slack channel.**
 
+[![CI](https://github.com/SlateGitOrg/pulseboard-ops/actions/workflows/ci.yml/badge.svg)](https://github.com/SlateGitOrg/pulseboard-ops/actions/workflows/ci.yml)
+
 ![pulseboard-ops](assets/hero.png)
 
-## The real problem
+## Why
 
 Early-stage startups need to watch business-critical events — failed payments, deploy errors, signup spikes — across the tools they already use, but full observability platforms (Datadog, PagerDuty) are enterprise-priced and enterprise-shaped. So most teams wire a handful of `curl` calls into a Slack webhook and call it monitoring. Nobody owns the noise, thresholds don't exist, and incidents pile up unread until a customer complains.
 
 pulseboard-ops is the middle ground: a small, self-hostable service that ingests events from Stripe, GitHub, and any generic JSON source (plus your own app via a tiny event SDK), evaluates them against rules you define (patterns, thresholds, spikes), and pushes triggered alerts to a live dashboard and to Slack/email — with per-tenant auth, signature-verified ingestion, and Redis-backed rate limiting so one noisy tenant can't take down another.
+
+## Features
+
+- **Three ingestion paths, all signature-verified**: Stripe-style (`t=,v1=` HMAC with replay-window tolerance), GitHub-style (`X-Hub-Signature-256`), and a generic JSON provider (`X-Pulseboard-Signature`) — plus a tiny [custom event SDK](sdk/pulseboardClient.js) reusing the generic scheme so your own app can `client.track('signup.created', {...})`.
+- **Rule engine** (MongoDB-backed) supporting three condition types:
+  - `pattern` — field-level match (`eq`, `neq`, `contains`, `gt`/`gte`/`lt`/`lte`, `regex`) against any event field, fires on the very next matching event.
+  - `threshold` — "N or more matching events in the last W minutes" (e.g. 5+ failed payments in 10 minutes).
+  - `spike` — current-window volume vs. a trailing baseline window, expressed as a multiplier (e.g. signups 3x above baseline).
+  - Every rule supports a cooldown window so a noisy source can't spam the same alert every second.
+- **Real-time multi-tenant dashboard** (React + Socket.IO): a live event feed, an alerts panel with acknowledge/resolve actions, and a rule manager — all scoped to the authenticated organization's Socket.IO room.
+- **Notification fan-out** to Slack (incoming webhook) and email (SMTP via nodemailer, with a safe no-op `jsonTransport` fallback when unconfigured), dispatched per-rule based on the `channels` you configure.
+- **Redis-backed rate limiting**, per API key, on every ingestion endpoint (fixed-window `INCR`/`PEXPIRE`), returning standard `X-RateLimit-*` headers and `429` once exceeded.
+- **Role-based multi-tenant auth**: JWT sessions with `owner` / `admin` / `member` roles; every query is scoped to `organizationId` so tenants can never see each other's data.
 
 ## Architecture
 
@@ -57,25 +72,14 @@ flowchart LR
 
 Flow in one sentence: **external providers → signature-verified webhook ingestion + custom event SDK → Redis rate-limit → rule engine (MongoDB) → Socket.IO push to a live multi-tenant dashboard, with Slack/email notification fan-out on triggered alerts.**
 
-## Features
-
-- **Three ingestion paths, all signature-verified**: Stripe-style (`t=,v1=` HMAC with replay-window tolerance), GitHub-style (`X-Hub-Signature-256`), and a generic JSON provider (`X-Pulseboard-Signature`) — plus a tiny [custom event SDK](sdk/pulseboardClient.js) reusing the generic scheme so your own app can `client.track('signup.created', {...})`.
-- **Rule engine** (MongoDB-backed) supporting three condition types:
-  - `pattern` — field-level match (`eq`, `neq`, `contains`, `gt`/`gte`/`lt`/`lte`, `regex`) against any event field, fires on the very next matching event.
-  - `threshold` — "N or more matching events in the last W minutes" (e.g. 5+ failed payments in 10 minutes).
-  - `spike` — current-window volume vs. a trailing baseline window, expressed as a multiplier (e.g. signups 3x above baseline).
-  - Every rule supports a cooldown window so a noisy source can't spam the same alert every second.
-- **Real-time multi-tenant dashboard** (React + Socket.IO): a live event feed, an alerts panel with acknowledge/resolve actions, and a rule manager — all scoped to the authenticated organization's Socket.IO room.
-- **Notification fan-out** to Slack (incoming webhook) and email (SMTP via nodemailer, with a safe no-op `jsonTransport` fallback when unconfigured), dispatched per-rule based on the `channels` you configure.
-- **Redis-backed rate limiting**, per API key, on every ingestion endpoint (fixed-window `INCR`/`PEXPIRE`), returning standard `X-RateLimit-*` headers and `429` once exceeded.
-- **Role-based multi-tenant auth**: JWT sessions with `owner` / `admin` / `member` roles; every query is scoped to `organizationId` so tenants can never see each other's data.
-
 ## Quick start
+
+Prerequisites: Node.js 20+ and npm. Docker with Compose is needed only for the full stack; MongoDB 7 and Redis 7 are needed only for a non-Docker dev run. The test suite needs none of them.
 
 ### Run the whole stack with Docker
 
 ```bash
-git clone <this-repo> pulseboard-ops && cd pulseboard-ops
+git clone https://github.com/SlateGitOrg/pulseboard-ops.git && cd pulseboard-ops
 JWT_SECRET=$(openssl rand -hex 32) docker compose up --build
 ```
 
@@ -99,14 +103,34 @@ npm install
 npm run dev                 # http://localhost:5173, proxies /api to :4000
 ```
 
-### Run the tests (fully offline, no Docker/Mongo/Redis required)
+## Usage
 
-```bash
-cd server
-npm test
+Send a signed event from your own app with the SDK (`sdk/pulseboardClient.js`):
+
+```js
+const { PulseboardClient } = require('./sdk/pulseboardClient');
+const client = new PulseboardClient({
+  baseUrl: 'http://localhost:4000',
+  keyId: 'pk_demo',            // from the registration response
+  secret: process.env.PULSEBOARD_SECRET,
+});
+await client.track('signup.created', { plan: 'pro' });
 ```
 
-The default suite (95 tests) never touches a real database or the network: Mongoose models are swapped for an in-memory fake store (`src/__tests__/helpers/fakeModel.js`) exercised through real Express + Supertest requests, and Redis is backed by `ioredis-mock`. An optional `npm run test:integration` suite exists for smoke-testing against a real `docker compose up -d mongo redis` stack, and is skipped automatically when those services aren't reachable.
+`client.buildRequest()` shows exactly what goes over the wire (captured with `keyId: 'pk_demo'`, `secret: 'whsec_demo'`):
+
+```json
+{
+  "url": "http://localhost:4000/api/events/pk_demo/track",
+  "rawBody": "{\"type\":\"signup.created\",\"properties\":{\"plan\":\"pro\"}}",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Pulseboard-Signature": "sha256=666f4cb654b15650a1f6e7d95efdc04b549b4280b1b53878de13f47e74c5d34e"
+  }
+}
+```
+
+Rules are created via `POST /api/rules` (owner/admin) with a `name`, a `conditionType` of `pattern`, `threshold` or `spike`, and a `config`: `field` + `operator` for patterns, `windowMinutes` + `count` for thresholds, `windowMinutes` + `factor` for spikes.
 
 ## How it works
 
@@ -116,7 +140,20 @@ The default suite (95 tests) never touches a real database or the network: Mongo
 4. **Alert.** Every triggered rule creates an `Alert` document and fans it out over the channels configured on the rule: `socket` (always pushed live), `slack` (incoming webhook), and/or `email` (SMTP).
 5. **Watch.** The React dashboard holds an authenticated Socket.IO connection scoped to the caller's organization room, and receives `event:new` / `alert:new` pushes the instant they happen — no polling.
 
-## Project structure
+## Testing
+
+```bash
+cd server
+npm ci
+npm test                    # 95 tests, fully offline
+npm run test:coverage       # with coverage
+npm run lint
+npm run test:integration    # optional; needs `docker compose up -d mongo redis`
+```
+
+The default suite never touches a real database or the network: Mongoose models are swapped for an in-memory fake store (`src/__tests__/helpers/fakeModel.js`) exercised through real Express + Supertest requests, and Redis is backed by `ioredis-mock`. It covers the signature verifiers, rule engine, rate limiter, auth and role middleware, notification fan-out, SDK signing and every route. The integration suite is skipped automatically when MongoDB and Redis aren't reachable. CI runs the unit suite and the client production build on every push.
+
+## Project layout
 
 ```
 pulseboard-ops/
@@ -137,9 +174,9 @@ pulseboard-ops/
 └── .github/workflows/ci.yml  # Runs the offline unit suite + client build on every push
 ```
 
-## Notes on scope
+## Limitations
 
-This is a solo-scale, credible implementation of the ingestion → rules → alerting loop, not an enterprise observability platform: no distributed tracing, no long-term metrics storage/rollups, no SSO. The rule engine, signature verification, rate limiter, and notification fan-out are real, tested logic — not stubs — and are the parts of the system worth demonstrating.
+Pulseboard covers the ingestion, rules and alerting loop and is not a full observability platform: no distributed tracing, no long-term metrics storage or rollups, no SSO. Threshold and spike rules query MongoDB for recent counts on each event, which is fine at small-team volume but is not a streaming aggregation pipeline. Slack and email are the only notification channels.
 
 ## License
 
